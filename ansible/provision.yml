@@ -1,0 +1,117 @@
+---
+# Разворачивает стек Compose и проверяет все три сайта внутри ВМ.
+- name: Развернуть динамический веб-стенд
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    web_dir: /opt/otus-dynamic-web
+    sites:
+      - {port: 8081, app: django, title: OTUS Django}
+      - {port: 8082, app: node, title: OTUS Node.js}
+      - {port: 8083, app: wordpress, title: OTUS WordPress}
+
+  tasks:
+    - name: Создать каталог настроек DNS
+      ansible.builtin.file:
+        path: /etc/systemd/resolved.conf.d
+        state: directory
+        mode: "0755"
+
+    - name: Настроить DNS VirtualBox NAT для доступа к репозиториям
+      ansible.builtin.copy:
+        dest: /etc/systemd/resolved.conf.d/90-otus-vbox-nat.conf
+        mode: "0644"
+        content: |
+          [Resolve]
+          DNS=10.0.2.3
+          Domains=~.
+          DNSSEC=no
+      notify: Перечитать DNS
+
+    - name: Применить DNS до загрузки пакетов
+      ansible.builtin.meta: flush_handlers
+
+    - name: Установить Docker Engine и Compose v2 из репозитория Ubuntu
+      ansible.builtin.apt:
+        name: [docker.io, docker-compose-v2, openssl]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+        install_recommends: false
+
+    - name: Запустить Docker и включить его при загрузке ВМ
+      ansible.builtin.systemd_service:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Создать каталог проекта
+      ansible.builtin.file:
+        path: "{{ web_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Скопировать манифест, конфигурацию Nginx и приложения
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../stack/{{ item }}"
+        dest: "{{ web_dir }}/"
+        owner: root
+        group: root
+        mode: preserve
+        directory_mode: "0755"
+      loop: [compose.yml, init-wordpress.sh, nginx, django, node]
+
+    - name: Сгенерировать пароли и ключ Django при первом запуске
+      ansible.builtin.shell: |
+        set -eu
+        umask 077
+        db_password=$(openssl rand -hex 24)
+        db_root_password=$(openssl rand -hex 24)
+        wp_admin_password=$(openssl rand -hex 24)
+        django_key=$(openssl rand -hex 32)
+        printf '%s\n' \
+          "WORDPRESS_DB_PASSWORD=$db_password" \
+          "MYSQL_ROOT_PASSWORD=$db_root_password" \
+          "WORDPRESS_ADMIN_PASSWORD=$wp_admin_password" \
+          "DJANGO_SECRET_KEY=$django_key" > .env.tmp
+        mv .env.tmp .env
+      args:
+        chdir: "{{ web_dir }}"
+        creates: "{{ web_dir }}/.env"
+      no_log: true
+
+    - name: Собрать образы и запустить контейнеры
+      ansible.builtin.command: docker compose up -d --build --wait --wait-timeout 300
+      args:
+        chdir: "{{ web_dir }}"
+      register: compose_up
+      changed_when: compose_up.stderr is search('Created|Recreated|Started|Built')
+
+    - name: Проверить код HTTP, заголовок Nginx и страницу каждого сайта
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ item.port }}/"
+        status_code: 200
+        return_content: true
+        follow_redirects: none
+        use_proxy: false
+      register: site_response
+      until: >-
+        site_response.status == 200
+        and site_response.x_otus_app | default('') == item.app
+        and item.title in site_response.content | default('')
+      retries: 30
+      delay: 3
+      loop: "{{ sites }}"
+      loop_control:
+        label: "{{ item.app }} на {{ item.port }}"
+
+  handlers:
+    - name: Перечитать DNS
+      ansible.builtin.systemd_service:
+        name: systemd-resolved
+        state: restarted
+
+# Версия 1 · 2026-11-11 · Docker, настройки и проверка трёх HTTP-портов.
